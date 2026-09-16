@@ -3,7 +3,7 @@ docs/requirement.md 原始项目背景信息和输入
 docs/SPEC.md   产品规格文档
 docs/ARCHITECTURE.md 架构设计文档
 
-## 禁止修改 requirement.md，除非得到我明确指示
+## 禁止修改 requirement.md，除非得到我明确允许
 
 ## 信息来源优先级
 当多个文档存在冲突时，按照以下优先级处理：
@@ -20,31 +20,18 @@ Agent 自己的推测。
 必须明确指出冲突；
 涉及需求或架构变化时，应暂停并请求确认。
 
-## 生成实施计划前必须：
+## 开发前必须
 
-1. 阅读 SPEC.md。
-2. 阅读 ARCHITECTURE.md。
-3. 阅读当前 Active Change。
-4. 确定本次变更涉及的 SPEC 要求。
-5. 确定本次变更涉及的架构模块。
-6. 检查实现方案是否违反 ARCHITECTURE.md。
-7. 生成 Change Design。
-8. Design 确认后才能生成 tasks.md。
+1. 阅读 docs/SPEC.md。
+2. 阅读 docs/ARCHITECTURE.md。
+3. 找到当前正在实施的 OpenSpec Change，阅读其 design.md 与 tasks.md。
+4. 检查与当前任务相关的现有代码。
+5. 确定本次变更涉及的 SPEC 要求与架构模块。
+6. 检查实现方案是否违反 ARCHITECTURE.md，确认与需求和架构一致。
+7. 生成 Change Design，Design 确认后才能生成 tasks.md。
 
-## 开始编码前
-agent必须：
-1.阅读 docs/SPEC.md；
-2.阅读 docs/ARCHITECTURE.md；
-3.找到当前正在实施的 OpenSpec Change；
-4.阅读当前 Change 的 design.md；
-5.阅读当前 Change 的 tasks.md；
-6.检查与当前任务相关的现有代码；
-7.确认实现方案与需求和架构一致。
 不得在不了解上述上下文的情况下直接开始大规模修改代码。
-未经更新 `ARCHITECTURE.md`，不得引入架构层面的变更。
-未经更新 `SPEC.md`，不得修改需求定义。
 不得跳过任务，也不得在未明确说明的情况下重新定义任务。
-Agent 不能擅自修改SPEC 来让测试通过。
 
 ## 编码过程中要遵守的原则
 优先实现简单实现便于人理解；
@@ -70,7 +57,3 @@ Agent 不能擅自修改SPEC 来让测试通过。
 当前 Change 的实现方案 → 更新 design.md；
 当前 Change 的执行任务 → 更新 tasks.md。
 不得为了形式而创建额外的文档。
-
-## 架构约束
-- 生成或修改任何代码前，必须先阅读 `ARCHITECTURE.md.md`，遵循其中的分层、模块边界与接口约定。
-- 若实现与架构文档冲突，先停下来指出冲突，不要擅自偏离。

@@ -28,7 +28,7 @@
 
 1. 将任务编排、飞控控制、状态管理、感知、目标管理和通信等职责解耦。
 2. 对 PX4、AI 算法、相机、路径规划等外部能力进行适配，而不是将外部系统逻辑耦合进业务模块。
-3. 支持 x86 与 RK3588 等不同计算平台。
+3. 支持 Ubuntu 22.04 上的 x86 与 RK3588 等不同计算平台。
 4. 支持可替换的 AI 算法插件。
 5. 支持 GCS 与 UAV 间统一的网络业务通信。
 6. 支持任务执行策略独立演进，而不要求修改外部 Task 数据模型。
@@ -119,7 +119,8 @@ Task Execution Engine
 - Pluma 加载细节；
 - AI 算法具体实现；
 - GeographicLib API；
-- ZLMediaKit API。
+- ZLMediaKit API；
+- nlohmann_json。
 
 这些能力通过内部抽象或 Adapter 进行隔离。
 
@@ -161,6 +162,18 @@ Task Execution Engine 负责：
 - 返回执行结果。
 
 Scheduler 不负责具体 BehaviorTree。
+
+---
+
+## 3.7 单一控制内容
+
+系统任意时刻最多执行一个控制内容（一个 Task 或一个 Command）。
+
+不维护指令队列或任务队列。
+
+新控制内容到达时，先终止当前控制内容，再执行最新收到的控制内容。
+
+Task 内部步骤产生的 Command 属于该 Task 的执行过程，不算作独立的控制内容。
 
 ---
 
@@ -206,6 +219,9 @@ Scheduler 不负责具体 BehaviorTree。
 | 飞控协议 | MAVLink | 飞控通信协议 |
 | 任务执行 | BehaviorTree.CPP | Task 执行策略与行为编排 |
 | 图像处理 | OpenCV | 图像与 `cv::Mat` 基础能力 |
+| 序列化 | nlohmann_json | 通信模块内外部消息反序列化 |
+| 格式化 | fmt | 字符串格式化 |
+| 枚举 | magic_enum | 枚举反射 |
 | 地理计算 | GeographicLib | WGS84 等地理计算 |
 | 插件系统 | Pluma | 可替换插件加载与管理 |
 | 日志 | spdlog | 系统统一日志 |
@@ -258,6 +274,7 @@ Scheduler 不负责具体 BehaviorTree。
 │                                              │
 │ Detection Plugin                             │
 │ Tracking Plugin                              │
+│ Guidance Plugin                              │
 │ 其他可替换算法/能力插件                      │
 └──────────────────────────────────────────────┘
 ```
@@ -278,9 +295,11 @@ Core Runtime 是系统级运行框架，不承担具体业务逻辑。
 - eventcpp 初始化；
 - Plugin Management 初始化；
 - 日志初始化；
-- 基础配置加载；
+- 系统参数管理（含安全高度：启动时加载默认配置，运行中接受地面站下发更新）；
 - 系统运行状态管理；
 - 模块启动顺序管理。
+
+不单独设立场景管理模块。安全高度作为系统参数维护：Task Execution Engine 在执行任务起飞步骤时读取该参数；Task Scheduler 在派发未另行指定高度的独立 Takeoff 指令时补入该参数。
 
 Core Runtime 不应成为业务逻辑集中处理的“上帝模块”。
 
@@ -290,28 +309,35 @@ Core Runtime 不应成为业务逻辑集中处理的“上帝模块”。
 
 # 8. Task Scheduler
 
-Task Scheduler 负责 Task 生命周期管理。
+Task Scheduler 是系统唯一的控制仲裁者，统一管理 Task 与独立 Command 两类控制内容（模块名称保持不变）。
+
+系统任意时刻最多存在一个「当前控制内容」，即一个 Task 或一个 Command，二者不得并行，也不维护指令队列或任务队列。新的 Task 或 Command 到达时，先终止当前控制内容，再执行最新收到的控制内容。
 
 主要职责：
 
 - 接收 Task；
-- 管理当前 Task；
+- 接收独立 Command（含航点飞行、航线飞行等作为指令下发的控制）；
+- 管理当前控制内容与 Task 生命周期；
 - 管理 Task 状态；
 - 启动 Task Execution Engine；
-- 中止当前 Task；
-- 处理新 Task 对当前 Task 的替换；
+- 中止当前 Task 或当前 Command；
+- 处理新控制内容对当前控制内容的替换；
+- 将通过仲裁的独立 Command 派发给 Flight Control；
+- 对未另行指定高度的 Takeoff（指令或任务）补入默认安全高度；
 - 接收 Task Execution Engine 返回的执行结果；
-- 对外提供当前 Task 状态。
+- 对外提供当前 Task 状态（含任务状态、当前执行的行为树、当前执行节点），无任务时提供「无任务」。
 
 Task Scheduler 不负责：
 
 - 决定 BehaviorTree 结构；
 - 选择具体 Node；
-- 直接控制飞控；
+- 绕过 Flight Control 直接操作 PX4；
 - 执行 AI 算法；
 - 判断具体飞行行为。
 
 Task Scheduler 与 Task Execution Engine 之间通过异步事件传递执行结果。
+
+Task Execution Engine 为当前 Task 内部步骤产生的 Command 属于该 Task 的执行过程，直达 Flight Control，不触发控制内容替换。
 
 ---
 
@@ -327,7 +353,8 @@ Task Execution Engine 是 Task 的实际执行层。
 4. 管理 Node；
 5. 调用其他能力模块；
 6. 根据实际系统状态判断 Node 执行结果；
-7. 向 Task Scheduler 异步返回执行结果。
+7. 向 Task Scheduler 异步返回执行结果；
+8. 向 Task Scheduler 报告当前执行的行为树与当前执行节点。
 
 Task Execution Engine 可以直接调用：
 
@@ -379,22 +406,37 @@ Task 类型到具体执行策略的映射属于机载系统内部实现。
 
 # 10. Command
 
-Command 是直接作用于 Flight Control 的低层控制输入。
+Command 是直接作用于 Flight Control 的低层控制输入。航点飞行、航线飞行等长动作也属于 Command，只是执行时间较长。
 
 Command 不属于 Task 数据结构。
 
-Command 不需要独立的 Task 生命周期管理，也不需要持续向 GCS 报告 Command 执行状态。
+Command 不需要独立的生命周期管理，也不需要持续向 GCS 报告 Command 执行状态；系统不跟踪 Command 的完成状态。
 
-Command 的基本路径：
+由 GCS 下发的独立 Command 必须经 Task Scheduler 仲裁后派发：
 
 ```text
-GCS / Task Execution
+GCS Command
+        │
+        ▼
+  Task Scheduler（仲裁 / 替换 / 补默认高度）
         │
         ▼
     Flight Control
         │
         ▼
-      PX4
+       PX4
+```
+
+由 Task Execution Engine 在当前 Task 步骤内产生的 Command 直接作用于 Flight Control：
+
+```text
+Task Execution Engine
+        │
+        ▼
+    Flight Control
+        │
+        ▼
+       PX4
 ```
 
 如果 Command 无法成功发送给 Flight Control，应产生错误/告警事件，使 GCS 能够感知。
@@ -427,6 +469,8 @@ UAV State Management 是系统统一的 UAV 状态来源。
 - 其他 UAV 最新状态；
 - GCS 相关状态。
 
+状态字段以 SPEC.md 第 4 章为准（含位置、高度、姿态、NED 速度与空速、电压、飞行模式、飞控连接状态；地面站状态含通信连接状态、空速、电压、WGS84 经纬度）。本架构不另行定义字段集合，避免与 SPEC 重复。
+
 状态来源包括：
 
 - Flight Control；
@@ -450,7 +494,6 @@ UAV State Management 是系统统一的 UAV 状态来源。
 State Management 不负责：
 
 - 安全决策；
-- Geofence 判断；
 - Task 成功/失败判断；
 - Target 管理。
 
@@ -462,13 +505,12 @@ StateMonitor 负责系统运行状态和安全相关状态监控。
 
 主要职责：
 
-- UAV 状态监控；
+- UAV 状态监控（电压、姿态等）；
 - 系统状态监控；
-- Geofence 检查；
 - 安全状态变化检测；
-- 产生安全相关事件。
+- 产生安全告警事件。
 
-Geofence 属于 StateMonitor 的职责范围。
+第一版本不包含电子围栏，也不监控链路质量。
 
 StateMonitor 不负责：
 
@@ -478,7 +520,7 @@ StateMonitor 不负责：
 - Task 编排；
 - 直接控制 PX4。
 
-StateMonitor 发现安全状态变化后，通过 eventcpp 或定义好的能力接口通知相关执行/安全处理模块。
+StateMonitor 只发布安全告警事件，由 Communication 上报地面站。StateMonitor 不自动中止任务或指令，不自动返航、降落，不接管其他无人机任务。
 
 ---
 
@@ -511,14 +553,15 @@ Flight Control
 - Waypoint；
 - Route；
 - Hover；
-- Stop Motor；
-- NED Velocity。
+- Stop Motor（仅接受地面站人工触发，机载 Task 与其他模块不得自主产生）；
+- NED Velocity（仅作机载内部控制能力，不作为地面站基础指令开放）。
 
 Flight Control 负责：
 
 - MAVSDK 集成；
 - MAVLink/PX4 交互；
-- 飞控连接生命周期；
+- 飞控连接生命周期：识别连接建立、正常通信、连接异常、连接恢复；连续 2 秒未收到有效飞控数据判定连接异常，并自动重连；
+- 飞控连接状态对外提供（进入 UAV State Management，并通过 eventcpp 发布状态变化）；
 - 飞控状态获取；
 - 飞控错误转换；
 - 飞控能力抽象。
@@ -534,7 +577,7 @@ Flight Control 不负责：
 
 # 14. Perception
 
-Perception 负责机载图像输入以及 AI 算法能力编排。
+Perception 负责机载图像输入、相机控制以及 AI 算法能力编排。不单独设立相机控制模块。
 
 总体结构：
 
@@ -542,17 +585,14 @@ Perception 负责机载图像输入以及 AI 算法能力编排。
 MIPI Camera
      │
      ▼
- Perception
+  Perception（建联 / 状态 / 控制指令）
      │
-     ├──────────────┐
-     ▼              ▼
-Detection        Tracking
- Plugin           Plugin
-     │              │
-     └──────┬───────┘
+     ├── Detection Plugin
+     ├── Tracking Plugin
+     └── Guidance Plugin
+            │
             ▼
-       Perception
-         Results
+       Perception Results
 ```
 
 ## 14.1 图像输入
@@ -570,35 +610,38 @@ Perception 每次获取最新的 `cv::Mat`。
 AI 算法插件分为：
 
 - Target Detection；
-- Single Target Tracking。
+- Single Target Tracking；
+- Image Guidance。
 
-Detection 与 Tracking 是两个独立能力，不强制规定固定流水线关系。
+三者是独立能力，不强制规定固定流水线关系。由 Perception 按任务阶段调度。
 
 AI Plugin 负责算法本身。
 
 Perception 负责：
 
+- 相机建联、状态获取、控制指令下发；
 - 相机生命周期；
 - 最新图像获取；
 - AI Plugin 调度；
-- Detection/Tracking 控制；
+- Detection / Tracking / Guidance 控制；
 - 结果事件发布。
 
 ---
 
-## 14.3 Tracking
+## 14.3 Tracking 与 Guidance
 
-Perception 对外提供业务级 Tracking 控制能力。
+Perception 对外提供业务级 Tracking / Guidance 控制能力。
 
 其他模块可以请求：
 
 - 启动指定目标 Tracking；
 - 停止 Tracking；
-- 根据任务需要改变 Tracking 状态。
+- 启动 / 停止图像导引；
+- 根据任务需要改变 Tracking 或 Guidance 状态。
 
-内部控制请求优先通过 eventcpp 进行异步传播。
+边界说明：Task Execution Engine 对 Perception 的同步调用仅限获取最新图像、查询相机状态等即时能力；启动 / 停止 Tracking、Guidance 等内部控制请求优先通过 eventcpp 进行异步传播。
 
-Detection/Tracking 结果也通过 eventcpp 向相关模块发布。
+Detection / Tracking / Guidance 结果也通过 eventcpp 向相关模块发布。
 
 ---
 
@@ -619,17 +662,19 @@ Target Management 是系统统一的 Target 信息来源。
 保存：
 
 - 当前 Target 信息；
-- 每个 Target 最近 20 条历史记录。
+- 每个 Target 最近 20 条历史记录（架构决策，见 ADR-015）。
+
+第一版本：不接入雷达目标；不将视觉目标转换为 WGS84；不对目标轨迹做平滑。
 
 Target Management 不负责：
 
 - Detection；
 - Tracking；
+- Guidance；
 - AI 算法；
-- UAV State；
-- Geofence。
+- UAV State。
 
-需要 Target 信息的其他模块应从 Target Management 查询，而不是直接访问 Detection/Tracking Plugin。
+需要 Target 信息的其他模块应从 Target Management 查询，而不是直接访问 Detection / Tracking / Guidance Plugin。
 
 轨迹评价属于独立能力，不由 Target Management 承担。
 
@@ -666,6 +711,8 @@ Video Streaming 负责：
 - ZLMediaKit 集成；
 - RTSP 输出。
 
+视频流叠加目标信息（Target Overlay）保留，属架构决策；叠加内容的字段在接口设计阶段确定。
+
 具体 Codec、MPP、buffer、zero-copy、RTP packetization 等实现细节不在当前架构层固定，待实现阶段根据平台性能需求确定。
 
 ---
@@ -678,17 +725,27 @@ Communication 是系统统一网络通信基础设施。
 
 > Zenoh / zenoh-cpp
 
+核心收发 API：
+
+- `sendToStation`：发往地面站；
+- `sendToplane`：发往指定无人机；
+- `sendToAll`：群发。
+
+优先使用 `sendToStation` / `sendToplane` 点对点发送，避免不必要的 `sendToAll` 广播。
+
+序列化：通信模块接收外部 `std::string`，根据 `messagetype` 反序列化为 `nlohmann::json` 再转为内部 class，放入 eventcpp 分发给业务模块。`nlohmann_json` 不出通信模块，业务模块不直接依赖 JSON。
+
+必须按可配置周期，将本机状态上报给地面站及其他无人机，并将当前任务状态上报给地面站（当前任务状态内容含任务状态、当前执行行为树、当前执行节点；无任务时为「无任务」）。数据从 UAV State Management / Task Scheduler 查询，由 Communication 发送。
+
 主要职责：
 
 - Zenoh Session 生命周期；
 - 网络连接；
-- 消息发送；
-- 消息接收；
-- ACK；
-- 超时；
-- 重试；
+- 消息发送与接收（含上述 API）；
+- ACK、超时、重试；
 - 网络状态；
-- 外部消息与内部消息之间的适配。
+- 外部消息反序列化与内部事件适配；
+- 本机状态与当前任务状态的周期上报。
 
 Communication 不负责：
 
@@ -707,7 +764,8 @@ Communication 不负责：
 - Command；
 - 本机 UAV State；
 - 当前 Task State；
-- Alert。
+- Alert；
+- 安全高度等系统参数的配置/修改。
 
 ---
 
@@ -717,6 +775,8 @@ Communication 不负责：
 
 - 本机 UAV State；
 - 其他业务信息。
+
+其他无人机不得向本机下发 Task。
 
 最多支持约 8 架 UAV 的业务通信规模。
 
@@ -818,13 +878,14 @@ Task Execution Engine
 Perception
     │
     ▼
- Plugin Interface
+  Plugin Interface
     │
     ▼
    Pluma
     │
     ├── Detection Plugin
-    └── Tracking Plugin
+    ├── Tracking Plugin
+    └── Guidance Plugin
 ```
 
 BehaviorTree 本身不是 Pluma Plugin。
@@ -867,6 +928,8 @@ Geographic Tool 作为系统内部统一地理计算能力。
 | 异步控制请求 | eventcpp |
 | GCS ↔ UAV | Zenoh |
 | UAV ↔ UAV | Zenoh |
+
+异步联动必须注册唯一 Event ID，发布方与订阅方通过事件解耦。同级模块不得交叉引入对方实现头文件，只允许依赖稳定能力接口做同步查询/调用。
 
 因此形成三层通信边界：
 
@@ -933,9 +996,11 @@ Business A
 
 形成循环依赖。
 
+Task Scheduler 可以向 Flight Control 派发独立 Command。
+
 Task Execution Engine 可以调用 Flight Control、UAV State Management、Perception、Target Management。
 
-被调用模块不得反向直接依赖 Task Execution Engine。
+被调用模块不得反向直接依赖 Task Scheduler 或 Task Execution Engine。
 
 如果需要异步返回结果，应使用 eventcpp。
 
@@ -1204,6 +1269,9 @@ namespace plane
 11. 让业务模块直接依赖 GeographicLib。
 12. 引入模块间循环依赖。
 13. 将一个模块固定绑定一个独立线程作为通用架构原则。
+14. 让地面站直接下发 NED 速度控制。
+15. 允许机载 Task 或其他模块自主触发 Stop Motor。
+16. 允许其他无人机向本机下发 Task。
 
 发生上述变化时，应先修改本文档，并通过 ADR 记录原因。
 
@@ -1396,6 +1464,13 @@ Task 需要根据任务类型执行复杂的机载行为，并根据实际 UAV �
 
 使用 BehaviorTree.CPP。
 
+### Alternatives
+
+- 手写状态机；
+- 自定义任务脚本 / 状态机框架；
+- 简单 if/else 流程；
+- BehaviorTree.CPP。
+
 ### Rationale
 
 BehaviorTree 可以将：
@@ -1480,7 +1555,7 @@ Task 与 Command 分离。
 
 ### Context
 
-AI Detection、Tracking 等算法需要支持替换。
+AI Detection、Tracking、图像导引等算法需要支持替换。
 
 ### Decision
 
@@ -1526,31 +1601,31 @@ AI 模块获取的是当前最新有效图像。
 
 ---
 
-## ADR-010：Detection 与 Tracking 作为独立 Plugin
+## ADR-010：Detection、Tracking 与图像导引作为独立 Plugin
 
 ### Context
 
-不同任务可能需要 Detection 或 Tracking，也可能在不同阶段使用不同算法。
+不同任务阶段可能需要 Detection、Tracking 或图像导引，也可能替换其中某一种算法。
 
 ### Decision
 
-Detection 和 Tracking 分别作为独立 Plugin 能力。
+Detection、Tracking、Image Guidance 分别作为独立 Plugin 能力。
 
 ### Rationale
 
 避免固定：
 
 ```text
-Detection → Tracking
+Detection → Tracking → Guidance
 ```
 
 流水线。
 
-Perception 根据业务需求控制两种能力。
+Perception 根据任务阶段调度这三种能力。
 
 ### Consequences
 
-未来可以独立替换 Detection 或 Tracking 算法。
+未来可以独立替换 Detection、Tracking 或图像导引算法。
 
 ---
 
@@ -1638,6 +1713,67 @@ RTSP
 
 ---
 
+## ADR-014：Task Scheduler 兼管独立 Command 仲裁
+
+### Context
+
+SPEC 要求系统任意时刻最多执行一个指令或一个任务，二者不得并行；新指令或新任务到达时立即终止当前内容并执行最新内容。原架构中 Command 直达 Flight Control，缺少统一仲裁点。
+
+### Decision
+
+由 Task Scheduler 兼管 Task 与独立 Command 的控制仲裁，保持模块名称不变。独立 Command 经 Task Scheduler 仲裁后派发；Task 内部步骤产生的 Command 直达 Flight Control。
+
+### Alternatives
+
+- 新增独立 Command Scheduler；
+- 由 Communication 仲裁；
+- 各调用方自行协调；
+- Task Scheduler 兼管。
+
+### Rationale
+
+- 仲裁点唯一，符合 SPEC 的「单一控制内容」模型；
+- 复用 Task 生命周期管理，避免新增模块与重复逻辑；
+- 未另行指定高度的 Takeoff 指令可在派发前补默认安全高度。
+
+### Consequences
+
+- Task Scheduler 职责扩展，模块名称与实际职责略有偏差，此处接受；
+- Task Scheduler 可调用 Flight Control；
+- 不跟踪独立 Command 的完成状态。
+
+---
+
+## ADR-015：GCS Target 保留 20 条历史记录
+
+### Context
+
+SPEC 未要求地面站目标的历史记录，但机载需要保留地面站目标近期的变化信息。
+
+### Decision
+
+Target Management 为每个 GCS Target 保留最近 20 条历史记录。
+
+### Alternatives
+
+- 不保留历史，只存最新值；
+- 保留固定 20 条；
+- 按时间窗口保留；
+- 保留全部。
+
+### Rationale
+
+- 20 条足以覆盖短时目标信息变化；
+- 避免无限增长的内存占用；
+- 满足地面站目标信息维护需要。
+
+### Consequences
+
+- 属架构决策，SPEC 未定义该数量；
+- 机载感知 Target 仍只保留最新信息，不保存历史轨迹。
+
+---
+
 # 30. 架构演进原则
 
 后续架构演进应遵循：
@@ -1671,7 +1807,9 @@ RTSP
 │                    Core Runtime                   │
 ├───────────────────────────────────────────────────┤
 │                                                   │
-│ Task Scheduler                                    │
+│ Task Scheduler  ← Task / Command 单一控制仲裁      │
+│      │                                            │
+│      ├──────── Command ──────────► Flight Control │
 │      │                                            │
 │      ▼                                            │
 │ Task Execution Engine                             │
@@ -1688,9 +1826,9 @@ RTSP
 │      │        ▼         ▼          ▼              │
 │      │       PX4      Plugins     Target          │
 │      │                 │                          │
-│      │           ┌─────┴─────┐                    │
-│      │           ▼           ▼                    │
-│      │       Detection    Tracking                │
+│      │        ┌──────┼──────┐                     │
+│      │        ▼      ▼      ▼                     │
+│      │   Detection Tracking Guidance              │
 │      │                                               │
 │ UAV State Management ───── StateMonitor            │
 │                                                   │
